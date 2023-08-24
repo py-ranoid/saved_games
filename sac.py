@@ -36,6 +36,10 @@ NUM_EPISODES = args.num_episodes
 EPS_GREEDY_PROB = args.epsilon
 LEARNING_RATE = 0.005
 GAMMA = 0.9
+TAU = 0.01
+CRITIC_LR = 0.05
+ACTOR_LR  = 0.05
+ALPHA = 1
 
 def __create_net(in_size, hidden_size, out_size):
     """Creates a two-layer fully connected neural net with ReLU before the hidden layer
@@ -64,19 +68,38 @@ class SAC(nn.Module):
     
     def __init__(self, num_states, num_actions):
         super(SAC, self).__init__()
-        self.policy_net     = __create_net(in_size=num_states, hidden_size=128, out_size= num_actions)
-        self.policy_net.add(nn.Softmax(dim=1))
-        self.s_value_net    = __create_net(in_size=num_states, hidden_size=128, out_size= 1)
-        self.s_value_target = __create_net(in_size=num_states, hidden_size=128, out_size= 1)
-        self.sa_value_net_1 = __create_net(in_size=num_states+num_actions, hidden_size=128, out_size= 1)
-        self.sa_value_net_2 = __create_net(in_size=num_states+num_actions, hidden_size=128, out_size= 1)
-        self.buffer = ReplayBuffer(storage=ListStorage(max_size=BUFFER_LEN))
         self.num_states = num_states
         self.num_actions = num_actions
+
+        # Initialize policy net
+        self.policy_net     = __create_net(in_size=num_states, hidden_size=128, out_size= num_actions)
+        self.policy_net.add(nn.Softmax(dim=1))
         reset_weights(self.policy_net)
-        reset_weights(self.s_value_net)
+
+        # Initialize Q nets and copy weights to target
+        self.sa_value_net_1 = __create_net(in_size=num_states, hidden_size=128, out_size= num_actions)
+        self.sa_value_net_2 = __create_net(in_size=num_states, hidden_size=128, out_size= num_actions)
+        self.sa_value_target_net_1 = __create_net(in_size=num_states, hidden_size=128, out_size= num_actions)
+        self.sa_value_target_net_2 = __create_net(in_size=num_states, hidden_size=128, out_size= num_actions)
         reset_weights(self.sa_value_net_1)
         reset_weights(self.sa_value_net_2)
+        self.sa_value_target_net_1.load_state_dict(self.sa_value_net_1.state_dict())
+        self.sa_value_target_net_2.load_state_dict(self.sa_value_net_2.state_dict())        
+
+        # Initialize alpha
+        self.log_alpha = torch.zeros(1, requires_grad=True, device=self.device)
+        self.alpha = self.log_alpha.exp()
+        self.alpha = ALPHA
+        #TODO: Skipping alpha optimisation
+
+        #Intialise replay buffer
+        self.buffer = ReplayBuffer(storage=ListStorage(max_size=BUFFER_LEN))
+        
+        #Initialise optimisers
+        self.critic_optim_1 = torch.optim.Adam(self.sa_value_net_1.parameters(), lr=CRITIC_LR, eps=1e-4)
+        self.critic_optim_2 = torch.optim.Adam(self.sa_value_net_2.parameters(), lr=CRITIC_LR, eps=1e-4)
+        self.policy_optim   = torch.optim.Adam(self.policy_net.parameters(), lr=ACTOR_LR, eps=1e-4)
+
         
     def forward(self):
       pass
@@ -93,6 +116,14 @@ class SAC(nn.Module):
         return actions, action_probs, log_action_probs
 
     def greedy_policy(self, states):
+        """Samples actions and picks actions with highest log probs. 
+
+        Args:
+            states (np.array): State to act at
+
+        Returns:
+            int: Index of action to take
+        """
         _, _,log_action_probs = self.sample_policy(states)
         greedy_action = torch.argmax(log_action_probs, dim=1, keepdim=True)
         return greedy_action
@@ -100,12 +131,19 @@ class SAC(nn.Module):
     def pack_buffer(self, transition_params):
       pass
     
-    def update(self):
+    def calc_state_val(self, state, target=True):
+        _, action_probs, log_action_probs = self.sample_policy(state)
+        #TODO: torch min or torch minimum?
+        min_state_values = torch.min(self.sa_value_target_net_1(state), self.sa_value_target_net_2(state))
+        state_val = (action_probs * (min_state_values - self.alpha * log_action_probs)).sum(dim=1, keepdim=True)
+        # state_val = (action_probs * (state_net(state) - self.alpha * log_action_probs)).sum(dim=1, keepdim=True)
+        return state_val
+    
+    def update(self, update_target):
       #Sample transitions from buffer
       buffer_samples = self.buffer.sample(batch_size=BUFFER_BATCH_SIZE)
-      net_state_val_losses = []
-      net_stact_val_1_losses = []
-      net_stact_val_2_losses = []
+      critic_1_losses = []
+      critic_2_losses = []
       policy_losses = []
       
       for sample in buffer_samples:
@@ -116,31 +154,28 @@ class SAC(nn.Module):
         buff_action = sample[2+2*self.num_states]
         _, action_probs, log_probs = self.sample_policy(curr_state)
 
-        # Computing state value net loss by Eq 6 
+        # Computing Actor loss by minimizing TD Error wrt target
         greedy_action = torch.argmax(log_probs, dim=1, keepdim=True)
-        q1_sa_value = self.sa_value_net_1(torch.stack([curr_state, greedy_action])).detach()
-        q2_sa_value = self.sa_value_net_2(torch.stack([curr_state, greedy_action])).detach()
-        min_sa_value = torch.min(q1_sa_value, q2_sa_value)
-        state_val_loss = (self.s_value_net(curr_state) - min_sa_value + log_probs[greedy_action].detach())
-        net_state_val_losses.append(state_val_loss)
-        
-        # Computing state-action value net losses by Eq 9
-        stact_val_loss_1 = (self.sa_value_net_1(torch.stack([curr_state, buff_action]))
-                            - reward_1 - GAMMA * self.s_value_target(next_state).detach())
-        stact_val_loss_2 = (self.sa_value_net_2(torch.stack([curr_state, buff_action]))
-                            - reward_1 - GAMMA * self.s_value_target(next_state).detach())
-        net_stact_val_1_losses.append(stact_val_loss_1)
-        net_stact_val_2_losses.append(stact_val_loss_2)
+        q1_s_a = self.sa_value_net_1(torch.stack([curr_state]))[buff_action]
+        q2_s_a = self.sa_value_net_2(torch.stack([curr_state]))[buff_action]
+        q_s_a_target = reward_1 + GAMMA * self.calc_state_val(next_state).detach()
+        critic_1_losses.append(q1_s_a - q_s_a_target)
+        critic_2_losses.append(q2_s_a - q_s_a_target)
         
         # Computing policy net losses by Eq 9
-        policy_loss = log_probs[greedy_action] - min_sa_value.detach()
+        min_s_val = torch.min(self.sa_value_net_1(curr_state), self.sa_value_net_2(curr_state))
+        policy_loss = (action_probs * (self.alpha * log_probs - min_s_val.detach())).sum(dim=1)
         policy_losses.append(policy_loss)
       
-      torch.stack(net_state_val_losses).sum().backward()
-      torch.stack(net_stact_val_1_losses).sum().backward()
-      torch.stack(net_stact_val_2_losses).sum().backward()
+      torch.stack(critic_1_losses).sum().backward()
+      torch.stack(critic_2_losses).sum().backward()
       torch.stack(policy_losses).sum().backward()
-        
+
+	  #Target network Soft update 
+      for target_param, local_param in zip(self.sa_value_target_net_1.parameters(), self.sa_value_net_1.parameters()):
+        target_param.data.copy_(TAU*local_param.data + (1.0-TAU)*target_param.data)
+      for target_param, local_param in zip(self.sa_value_target_net_2.parameters(), self.sa_value_net_2.parameters()):
+        target_param.data.copy_(TAU*local_param.data + (1.0-TAU)*target_param.data)
             
           
 class IPDEnv(gym.Env):
@@ -215,6 +250,8 @@ def run(num_episodes=NUM_EPISODES, reset_interval=RESET_INTERVAL):
             # transition_params = {"reward_1":reward_1, "reward_2":reward_2, "curr_state":curr_state, "next_state":next_state}            
             buffer_t = torch.tensor(np.hstack((rewards, curr_state, next_state, action_t)))
             ep_buffer.append(buffer_t)
-            if is_done: break
+            if is_done: 
+              break
         agent.buffer.extend(ep_buffer)
+        agent.update()
     
