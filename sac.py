@@ -9,9 +9,9 @@ import torch.optim as optim
 from torch.distributions import Categorical
 from torchrl.data import ReplayBuffer, ListStorage
 
-device = torch.device('cpu')
+DEVICE = torch.device('cpu')
 if torch.cuda.is_available():
-    device = torch.device('cuda')
+    DEVICE = torch.device('cuda')
  
 parser = argparse.ArgumentParser(description='PyTorch actor-critic example')
 parser.add_argument('--gamma', type=float, default=0.99)
@@ -28,7 +28,7 @@ args = parser.parse_args()
 POL_HID_SIZE = 128
 MARKOVIAN_STATES = ['XX', 'CC', 'CD', 'DC', 'DD'] 
 STATES_LEN = len(MARKOVIAN_STATES)
-EP_LENGTH = 500
+EP_LENGTH = 50
 RESET_INTERVAL = args.reset_interval
 BUFFER_BATCH_SIZE = args.batch_size
 BUFFER_LEN = args.buffer_size
@@ -40,8 +40,12 @@ TAU = 0.01
 CRITIC_LR = 0.05
 ACTOR_LR  = 0.05
 ALPHA = 1
+SEED = 42
 
-def __create_net(in_size, hidden_size, out_size):
+def a2_policy():
+    return 0
+ 
+def create_net(in_size, hidden_size, out_size):
     """Creates a two-layer fully connected neural net with ReLU before the hidden layer
 
     Args:
@@ -50,7 +54,7 @@ def __create_net(in_size, hidden_size, out_size):
         out_size (_type_): _description_
 
     Returns:
-        _type_: _description_
+        nn.Sequential: neural net
     """
     return nn.Sequential(nn.Linear(in_size, hidden_size), 
                          nn.ReLU(),
@@ -70,24 +74,24 @@ class SAC(nn.Module):
         super(SAC, self).__init__()
         self.num_states = num_states
         self.num_actions = num_actions
-
+		
         # Initialize policy net
-        self.policy_net     = __create_net(in_size=num_states, hidden_size=128, out_size= num_actions)
-        self.policy_net.add(nn.Softmax(dim=1))
+        self.policy_net     = create_net(in_size=num_states, hidden_size=128, out_size= num_actions)
+        self.policy_net.append(nn.Softmax(dim=1))
         reset_weights(self.policy_net)
 
         # Initialize Q nets and copy weights to target
-        self.sa_value_net_1 = __create_net(in_size=num_states, hidden_size=128, out_size= num_actions)
-        self.sa_value_net_2 = __create_net(in_size=num_states, hidden_size=128, out_size= num_actions)
-        self.sa_value_target_net_1 = __create_net(in_size=num_states, hidden_size=128, out_size= num_actions)
-        self.sa_value_target_net_2 = __create_net(in_size=num_states, hidden_size=128, out_size= num_actions)
+        self.sa_value_net_1 = create_net(in_size=num_states, hidden_size=128, out_size= num_actions)
+        self.sa_value_net_2 = create_net(in_size=num_states, hidden_size=128, out_size= num_actions)
+        self.sa_value_target_net_1 = create_net(in_size=num_states, hidden_size=128, out_size= num_actions)
+        self.sa_value_target_net_2 = create_net(in_size=num_states, hidden_size=128, out_size= num_actions)
         reset_weights(self.sa_value_net_1)
         reset_weights(self.sa_value_net_2)
         self.sa_value_target_net_1.load_state_dict(self.sa_value_net_1.state_dict())
         self.sa_value_target_net_2.load_state_dict(self.sa_value_net_2.state_dict())        
 
         # Initialize alpha
-        self.log_alpha = torch.zeros(1, requires_grad=True, device=self.device)
+        self.log_alpha = torch.zeros(1, requires_grad=True, device=DEVICE)
         self.alpha = self.log_alpha.exp()
         self.alpha = ALPHA
         #TODO: Skipping alpha optimisation
@@ -139,6 +143,13 @@ class SAC(nn.Module):
         # state_val = (action_probs * (state_net(state) - self.alpha * log_action_probs)).sum(dim=1, keepdim=True)
         return state_val
     
+    def unpack_buffer(self, sample):
+        reward_1 	= sample[0]
+        curr_state 	= sample[1:2+self.num_states]
+        next_state 	= sample[1+self.num_states:1+2*self.num_states]
+        buff_action = sample[1+2*self.num_states]
+        return reward_1, curr_state, next_state, buff_action
+
     def update(self, update_target):
       #Sample transitions from buffer
       buffer_samples = self.buffer.sample(batch_size=BUFFER_BATCH_SIZE)
@@ -148,10 +159,7 @@ class SAC(nn.Module):
       
       for sample in buffer_samples:
         # (np.hstack((rewards, curr_state, next_state, action_t)))
-        reward_1, reward_2 = sample[0], sample[1]
-        curr_state = sample[2:2+self.num_states]
-        next_state = sample[2+self.num_states:2+2*self.num_states]
-        buff_action = sample[2+2*self.num_states]
+        reward_1, curr_state, next_state, buff_action = self.unpack_buffer(sample)
         _, action_probs, log_probs = self.sample_policy(curr_state)
 
         # Computing Actor loss by minimizing TD Error wrt target
@@ -223,35 +231,42 @@ class IPDEnv(gym.Env):
                              (action[0] == 1) & (action[1] == 1)])
     observation = observation.astype(np.float32)
     done_flag = self.curr_t == self.ep_length -1
-    return observation, rewards, done_flag, []
+    return observation, rewards, done_flag, [], []
 
     # Execute one time step within the environment
     ...
-  def reset(self):
+  def reset(self, seed=42):
     self.curr_t = 0
-    return np.array([1, 0, 0, 0, 0]) 
+    return np.array([1, 0, 0, 0, 0]), None
     # Reset the state of the environment to an initial state
 
   def render(self, mode='human', close=False):
     pass
 
-def run(num_episodes=NUM_EPISODES, reset_interval=RESET_INTERVAL):
-    env = IPDEnv(ep_length=50)
-    curr_state, _ = env.reset()
+def run(env_name = 'ipd', num_episodes=NUM_EPISODES, reset_interval=RESET_INTERVAL):    
+    env = IPDEnv(ep_length=EP_LENGTH) if env_name == 'ipd' else gym.make('CartPole-v1')
+    curr_state, _ = env.reset(seed=SEED)
     agent = SAC(num_states=len(curr_state), num_actions=2)
     for ep_num in range(num_episodes):
+        curr_state, _ = env.reset(seed=SEED)
         ep_buffer = []
         while True:
             action_t = agent.greedy_policy(curr_state)
-            action_t = [0, action_t]
-            next_state, rewards, is_done = env.step(action_t, dry_run=False)
-            reward_1 = rewards[0]
-            reward_2 = rewards[1]
-            # transition_params = {"reward_1":reward_1, "reward_2":reward_2, "curr_state":curr_state, "next_state":next_state}            
-            buffer_t = torch.tensor(np.hstack((rewards, curr_state, next_state, action_t)))
+            action_t = [action_t, a2_policy()] if env_name == "ipd" else action_t
+            next_state, rewards, is_done, _, _ = env.step(action_t, dry_run=False)
+            reward_1 = rewards[0] if env_name == 'ipd' else rewards
+            buffer_t = torch.tensor(np.hstack((reward_1, curr_state, next_state, action_t)))
             ep_buffer.append(buffer_t)
             if is_done: 
               break
         agent.buffer.extend(ep_buffer)
+        agent.critic_optim_1.zero_grad()
+        agent.critic_optim_2.zero_grad()
+        agent.policy_optim.zero_grad()
         agent.update()
+        agent.critic_optim_1.step()
+        agent.critic_optim_2.step()
+        agent.policy_optim.step()
     
+if __name__ == "__main__":
+    run(env_name='cartpole')
