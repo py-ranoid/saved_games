@@ -35,10 +35,10 @@ BUFFER_LEN = args.buffer_size
 NUM_EPISODES = args.num_episodes
 EPS_GREEDY_PROB = args.epsilon
 LEARNING_RATE = 0.005
-GAMMA = 0.9
+GAMMA = 0.95
 TAU = 0.01
-CRITIC_LR = 0.05
-ACTOR_LR  = 0.05
+CRITIC_LR = 0.005
+ACTOR_LR  = 0.005
 ALPHA = 1
 SEED = 42
 
@@ -77,21 +77,21 @@ class SAC(nn.Module):
 		
         # Initialize policy net
         self.policy_net     = create_net(in_size=num_states, hidden_size=128, out_size= num_actions)
-        self.policy_net.append(nn.Softmax(dim=1))
+        self.policy_net.append(nn.Softmax(dim=-1))
         reset_weights(self.policy_net)
 
         # Initialize Q nets and copy weights to target
-        self.sa_value_net_1 = create_net(in_size=num_states, hidden_size=128, out_size= num_actions)
-        self.sa_value_net_2 = create_net(in_size=num_states, hidden_size=128, out_size= num_actions)
-        self.sa_value_target_net_1 = create_net(in_size=num_states, hidden_size=128, out_size= num_actions)
-        self.sa_value_target_net_2 = create_net(in_size=num_states, hidden_size=128, out_size= num_actions)
+        self.sa_value_net_1         = create_net(in_size=num_states, hidden_size=128, out_size= num_actions)
+        self.sa_value_net_2         = create_net(in_size=num_states, hidden_size=128, out_size= num_actions)
+        self.sa_value_target_net_1  = create_net(in_size=num_states, hidden_size=128, out_size= num_actions)
+        self.sa_value_target_net_2  = create_net(in_size=num_states, hidden_size=128, out_size= num_actions)
         reset_weights(self.sa_value_net_1)
         reset_weights(self.sa_value_net_2)
         self.sa_value_target_net_1.load_state_dict(self.sa_value_net_1.state_dict())
         self.sa_value_target_net_2.load_state_dict(self.sa_value_net_2.state_dict())        
 
         # Initialize alpha
-        self.log_alpha = torch.zeros(1, requires_grad=True, device=DEVICE)
+        self.log_alpha = torch.zeros(1, requires_grad=False, device=DEVICE)
         self.alpha = self.log_alpha.exp()
         self.alpha = ALPHA
         #TODO: Skipping alpha optimisation
@@ -109,13 +109,12 @@ class SAC(nn.Module):
       pass
         
     def sample_policy(self, states):
-        action_probs = F.softmax(self.policy_net(states), dim=1)
+        action_probs = self.policy_net(states)
         action_dist = Categorical(action_probs)
         actions = action_dist.sample().view(-1, 1)
 
         # Avoid numerical instability.
-        z = (action_probs == 0.0).float() * 1e-8
-        log_action_probs = torch.log(action_probs + z)
+        log_action_probs = torch.log(action_probs + 1e-8)
 
         return actions, action_probs, log_action_probs
 
@@ -129,29 +128,30 @@ class SAC(nn.Module):
             int: Index of action to take
         """
         _, _,log_action_probs = self.sample_policy(states)
-        greedy_action = torch.argmax(log_action_probs, dim=1, keepdim=True)
-        return greedy_action
-
-    def pack_buffer(self, transition_params):
-      pass
+        greedy_action = torch.argmax(log_action_probs, dim=-1, keepdim=True)
+        return greedy_action.detach().item()
     
     def calc_state_val(self, state, target=True):
         _, action_probs, log_action_probs = self.sample_policy(state)
         #TODO: torch min or torch minimum?
         min_state_values = torch.min(self.sa_value_target_net_1(state), self.sa_value_target_net_2(state))
-        state_val = (action_probs * (min_state_values - self.alpha * log_action_probs)).sum(dim=1, keepdim=True)
+        state_val = (action_probs * (min_state_values - self.alpha * log_action_probs)).sum(dim=-1, keepdim=True)
         # state_val = (action_probs * (state_net(state) - self.alpha * log_action_probs)).sum(dim=1, keepdim=True)
         return state_val
     
     def unpack_buffer(self, sample):
         reward_1 	= sample[0]
-        curr_state 	= sample[1:2+self.num_states]
-        next_state 	= sample[1+self.num_states:1+2*self.num_states]
-        buff_action = sample[1+2*self.num_states]
+        curr_state 	= sample[1:1+self.num_states].float()
+        next_state 	= sample[1+self.num_states:1+2*self.num_states].float()
+        buff_action = sample[1+2*self.num_states].detach().int().item()
         return reward_1, curr_state, next_state, buff_action
 
-    def update(self, update_target):
+    def update(self):
       #Sample transitions from buffer
+      self.critic_optim_1.zero_grad()
+      self.critic_optim_2.zero_grad()
+      self.policy_optim.zero_grad()
+      
       buffer_samples = self.buffer.sample(batch_size=BUFFER_BATCH_SIZE)
       critic_1_losses = []
       critic_2_losses = []
@@ -160,30 +160,41 @@ class SAC(nn.Module):
       for sample in buffer_samples:
         # (np.hstack((rewards, curr_state, next_state, action_t)))
         reward_1, curr_state, next_state, buff_action = self.unpack_buffer(sample)
-        _, action_probs, log_probs = self.sample_policy(curr_state)
 
         # Computing Actor loss by minimizing TD Error wrt target
-        greedy_action = torch.argmax(log_probs, dim=1, keepdim=True)
-        q1_s_a = self.sa_value_net_1(torch.stack([curr_state]))[buff_action]
-        q2_s_a = self.sa_value_net_2(torch.stack([curr_state]))[buff_action]
-        q_s_a_target = reward_1 + GAMMA * self.calc_state_val(next_state).detach()
-        critic_1_losses.append(q1_s_a - q_s_a_target)
-        critic_2_losses.append(q2_s_a - q_s_a_target)
+        # greedy_action = torch.argmax(log_probs, dim=1, keepdim=True)
+        q1_s_a = self.sa_value_net_1(curr_state)[buff_action]
+        q2_s_a = self.sa_value_net_2(curr_state)[buff_action]
+        q_s_a_target = reward_1 + GAMMA * self.calc_state_val(next_state)
+        critic_1_losses.append(F.mse_loss(q1_s_a, q_s_a_target.detach()))
+        critic_2_losses.append(F.mse_loss(q2_s_a, q_s_a_target.detach()))
+        # critic_1_losses.append(q1_s_a - q_s_a_target.detach())
+        # critic_2_losses.append(q2_s_a - q_s_a_target.detach())
         
         # Computing policy net losses by Eq 9
         min_s_val = torch.min(self.sa_value_net_1(curr_state), self.sa_value_net_2(curr_state))
-        policy_loss = (action_probs * (self.alpha * log_probs - min_s_val.detach())).sum(dim=1)
+        _, action_probs, log_probs = self.sample_policy(curr_state)
+        policy_loss = (action_probs * (self.alpha * log_probs - min_s_val.detach())).sum(dim=-1)
         policy_losses.append(policy_loss)
       
-      torch.stack(critic_1_losses).sum().backward()
-      torch.stack(critic_2_losses).sum().backward()
-      torch.stack(policy_losses).sum().backward()
+      
+      critic_1_loss = torch.stack(critic_1_losses).sum()
+      critic_2_loss = torch.stack(critic_2_losses).sum()
+      policy_loss   = torch.stack(policy_losses).sum()
+      net_loss = critic_1_loss + critic_2_loss + policy_loss
+      net_loss.backward()
+
+      self.critic_optim_1.step()
+      self.critic_optim_2.step()
+      self.policy_optim.step()
 
 	  #Target network Soft update 
       for target_param, local_param in zip(self.sa_value_target_net_1.parameters(), self.sa_value_net_1.parameters()):
         target_param.data.copy_(TAU*local_param.data + (1.0-TAU)*target_param.data)
       for target_param, local_param in zip(self.sa_value_target_net_2.parameters(), self.sa_value_net_2.parameters()):
         target_param.data.copy_(TAU*local_param.data + (1.0-TAU)*target_param.data)
+      
+      return critic_1_loss.detach().item(), critic_2_loss.detach().item(), policy_loss.detach().item(), net_loss
             
           
 class IPDEnv(gym.Env):
@@ -249,24 +260,30 @@ def run(env_name = 'ipd', num_episodes=NUM_EPISODES, reset_interval=RESET_INTERV
     agent = SAC(num_states=len(curr_state), num_actions=2)
     for ep_num in range(num_episodes):
         curr_state, _ = env.reset(seed=SEED)
+        curr_state = torch.tensor(curr_state)
         ep_buffer = []
+        episode_reward = 0
+        actions_taken = []
         while True:
             action_t = agent.greedy_policy(curr_state)
             action_t = [action_t, a2_policy()] if env_name == "ipd" else action_t
-            next_state, rewards, is_done, _, _ = env.step(action_t, dry_run=False)
+            actions_taken.append(action_t)
+            next_state, rewards, is_done, _, _ = env.step(action_t)
             reward_1 = rewards[0] if env_name == 'ipd' else rewards
+            episode_reward += reward_1
             buffer_t = torch.tensor(np.hstack((reward_1, curr_state, next_state, action_t)))
             ep_buffer.append(buffer_t)
-            if is_done: 
-              break
+            if is_done: break
+        # for i in range(len(ep_buffer)-2, -1, -1):
+        #   ep_buffer[i][0] = ep_buffer[i+1][0]*GAMMA + ep_buffer[i][0]
+        print(f"Episode: {ep_num} \t Episode Reward : {episode_reward} \t Buffer Len : {len(agent.buffer)}")
+        print(actions_taken)
         agent.buffer.extend(ep_buffer)
-        agent.critic_optim_1.zero_grad()
-        agent.critic_optim_2.zero_grad()
-        agent.policy_optim.zero_grad()
-        agent.update()
-        agent.critic_optim_1.step()
-        agent.critic_optim_2.step()
-        agent.policy_optim.step()
+        if len(agent.buffer) < BUFFER_BATCH_SIZE: 
+            print("Filling buffer. Skipping update")
+            continue
+        c1_loss, c2_loss, pol_loss, net_loss = agent.update()
+        print(f"Critic Losses : {round(c1_loss,4)} | {round(c2_loss,4)}. \t Policy loss : {pol_loss} \t Net : {net_loss}")
     
 if __name__ == "__main__":
     run(env_name='cartpole')
