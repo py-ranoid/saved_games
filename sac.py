@@ -2,6 +2,7 @@ import gym
 import argparse
 import numpy as np
 from gym import spaces
+import wandb
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -17,12 +18,16 @@ parser = argparse.ArgumentParser(description='PyTorch actor-critic example')
 parser.add_argument('--gamma', type=float, default=0.99)
 parser.add_argument('--seed', type=int, default=543)
 parser.add_argument('--render', action='store_true')
-parser.add_argument('--log-interval', type=int, default=1)
+parser.add_argument('--log-interval', type=int, default=50)
 parser.add_argument('--reset-interval', type=int, default=100)
 parser.add_argument('--buffer-size', type=int, default=512)
 parser.add_argument('--batch-size', type=int, default=256)
+parser.add_argument('--agent2', type=int, default=1)
 parser.add_argument('--num-episodes', type=int, default=750)
+parser.add_argument('--alpha', type=float, default=1)
 parser.add_argument('--epsilon', type=float, default=0.8)
+parser.add_argument('--alr', type=float, default=0.005)
+parser.add_argument('--clr', type=float, default=0.005)
 args = parser.parse_args()
 
 POL_HID_SIZE = 128
@@ -36,14 +41,13 @@ NUM_EPISODES = args.num_episodes
 EPS_GREEDY_PROB = args.epsilon
 LEARNING_RATE = 0.005
 GAMMA = 0.95
-TAU = 0.01
-CRITIC_LR = 0.005
-ACTOR_LR  = 0.005
-ALPHA = 1
+TAU = 0.005
+CRITIC_LR = args.clr
+ACTOR_LR  = args.alr
+ALPHA = args.alpha
 SEED = 42
-
 def a2_policy():
-    return 0
+    return args.agent2
  
 def create_net(in_size, hidden_size, out_size):
     """Creates a two-layer fully connected neural net with ReLU before the hidden layer
@@ -156,32 +160,33 @@ class SAC(nn.Module):
       critic_1_losses = []
       critic_2_losses = []
       policy_losses = []
+      entropies = []
       
       for sample in buffer_samples:
         # (np.hstack((rewards, curr_state, next_state, action_t)))
         reward_1, curr_state, next_state, buff_action = self.unpack_buffer(sample)
 
         # Computing Actor loss by minimizing TD Error wrt target
-        # greedy_action = torch.argmax(log_probs, dim=1, keepdim=True)
         q1_s_a = self.sa_value_net_1(curr_state)[buff_action]
         q2_s_a = self.sa_value_net_2(curr_state)[buff_action]
         q_s_a_target = reward_1 + GAMMA * self.calc_state_val(next_state)
         critic_1_losses.append(F.mse_loss(q1_s_a, q_s_a_target.detach()))
         critic_2_losses.append(F.mse_loss(q2_s_a, q_s_a_target.detach()))
-        # critic_1_losses.append(q1_s_a - q_s_a_target.detach())
-        # critic_2_losses.append(q2_s_a - q_s_a_target.detach())
         
         # Computing policy net losses by Eq 9
         min_s_val = torch.min(self.sa_value_net_1(curr_state), self.sa_value_net_2(curr_state))
         _, action_probs, log_probs = self.sample_policy(curr_state)
         policy_loss = (action_probs * (self.alpha * log_probs - min_s_val.detach())).sum(dim=-1)
+        entropy = -(action_probs * log_probs).sum(dim=-1)
         policy_losses.append(policy_loss)
+        entropies.append(entropy)
       
       
       critic_1_loss = torch.stack(critic_1_losses).sum()
       critic_2_loss = torch.stack(critic_2_losses).sum()
       policy_loss   = torch.stack(policy_losses).sum()
-      net_loss = critic_1_loss + critic_2_loss + policy_loss
+      mean_entropy  = torch.stack(entropies).mean()
+      net_loss = (critic_1_loss + critic_2_loss)/2 + policy_loss
       net_loss.backward()
 
       self.critic_optim_1.step()
@@ -194,7 +199,7 @@ class SAC(nn.Module):
       for target_param, local_param in zip(self.sa_value_target_net_2.parameters(), self.sa_value_net_2.parameters()):
         target_param.data.copy_(TAU*local_param.data + (1.0-TAU)*target_param.data)
       
-      return critic_1_loss.detach().item(), critic_2_loss.detach().item(), policy_loss.detach().item(), net_loss
+      return critic_1_loss.detach().item(), critic_2_loss.detach().item(), policy_loss.detach().item(), net_loss, mean_entropy
             
           
 class IPDEnv(gym.Env):
@@ -255,35 +260,74 @@ class IPDEnv(gym.Env):
     pass
 
 def run(env_name = 'ipd', num_episodes=NUM_EPISODES, reset_interval=RESET_INTERVAL):    
+    global EP_LENGTH
+    EP_LENGTH = 500 if env_name == 'cartpole' else EP_LENGTH
     env = IPDEnv(ep_length=EP_LENGTH) if env_name == 'ipd' else gym.make('CartPole-v1')
     curr_state, _ = env.reset(seed=SEED)
     agent = SAC(num_states=len(curr_state), num_actions=2)
     for ep_num in range(num_episodes):
         curr_state, _ = env.reset(seed=SEED)
-        curr_state = torch.tensor(curr_state)
+        curr_state = torch.tensor(curr_state).float()
         ep_buffer = []
         episode_reward = 0
         actions_taken = []
-        while True:
+        rewards_recd = []
+        epsilon = EPS_GREEDY_PROB
+        epsilon += max(float(ep_num)*0.2/500.0,0.2)
+        # eps_greedy_flags_1 = torch.rand(EP_LENGTH+1)> epsilon
+        for i in range(EP_LENGTH+1):
+            #Choose and execute action
+            # action_t = agent.greedy_policy(curr_state) if not eps_greedy_flags_1[i] else np.random.choice([0,1]).item()
             action_t = agent.greedy_policy(curr_state)
             action_t = [action_t, a2_policy()] if env_name == "ipd" else action_t
             actions_taken.append(action_t)
             next_state, rewards, is_done, _, _ = env.step(action_t)
+            
+            #Compute and edit reward if needed
             reward_1 = rewards[0] if env_name == 'ipd' else rewards
             episode_reward += reward_1
+            if env_name == 'cartpole' and is_done and len(ep_buffer) < 400: reward_1 =-5
+            
+            #Add to buffer and update next state
             buffer_t = torch.tensor(np.hstack((reward_1, curr_state, next_state, action_t)))
             ep_buffer.append(buffer_t)
+            curr_state = torch.tensor(next_state).float()
+            
             if is_done: break
         # for i in range(len(ep_buffer)-2, -1, -1):
         #   ep_buffer[i][0] = ep_buffer[i+1][0]*GAMMA + ep_buffer[i][0]
-        print(f"Episode: {ep_num} \t Episode Reward : {episode_reward} \t Buffer Len : {len(agent.buffer)}")
-        print(actions_taken)
         agent.buffer.extend(ep_buffer)
         if len(agent.buffer) < BUFFER_BATCH_SIZE: 
             print("Filling buffer. Skipping update")
             continue
-        c1_loss, c2_loss, pol_loss, net_loss = agent.update()
-        print(f"Critic Losses : {round(c1_loss,4)} | {round(c2_loss,4)}. \t Policy loss : {pol_loss} \t Net : {net_loss}")
+        c1_loss, c2_loss, pol_loss, net_loss, mean_entropy = agent.update()
+        wandb.log({"Episode":ep_num,  "Ep Reward": episode_reward, "Critic Loss 1" : round(c1_loss,2), "Critic Loss 2" : round(c2_loss,2), 
+                   "Policy loss" : round(pol_loss,2),  "Net": round(net_loss.item(),2), "Entropy":round(mean_entropy.item(),2)})
+        print(f"Episode: {ep_num} \t Ep Reward : {episode_reward} \t Critic Losses : {round(c1_loss,2)} \t | {round(c2_loss,2)}. \t Policy loss : {round(pol_loss,2)} \t Net : {round(net_loss.item(),2)} \t Entropy:{round(mean_entropy.item(),2)}")
+        # log results
+        if ep_num % args.log_interval == 0:
+            defect_probs = {}
+            for agent_ind, agent_model in enumerate([agent]):
+                for state_ind, state_name in enumerate(MARKOVIAN_STATES):
+                    state = torch.zeros((5))
+                    state[state_ind] = 1
+                    _, state_action_probs, _ = agent_model.sample_policy(state)
+                    print("A%d Defect Prob - %s : %r"%(agent_ind, state_name, state_action_probs.detach()[1]))
+                    defect_probs["A%d Defect Prob - %s"%(agent_ind, state_name)] = state_action_probs.detach()[1]
+            wandb.log(defect_probs)
     
 if __name__ == "__main__":
-    run(env_name='cartpole')
+    RUN_ENV = 'ipd'
+    exp_args = {'game':RUN_ENV,
+                'batch_size':BUFFER_BATCH_SIZE, 
+                'buffer_len': BUFFER_LEN, 
+                'critic_lr': CRITIC_LR,
+                'actor_lr': ACTOR_LR,
+                'epsilon': EPS_GREEDY_PROB, 
+                'tau':TAU,
+                'gamma':GAMMA,
+                'alpha':ALPHA,
+                'ep_length':EP_LENGTH
+                }
+    wandb.init(project="IPD Actor-Critic v2", config=exp_args)
+    run(env_name=RUN_ENV)
