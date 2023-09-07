@@ -18,16 +18,17 @@ parser = argparse.ArgumentParser(description='PyTorch actor-critic example')
 parser.add_argument('--gamma', type=float, default=0.99)
 parser.add_argument('--seed', type=int, default=543)
 parser.add_argument('--render', action='store_true')
-parser.add_argument('--log-interval', type=int, default=50)
+parser.add_argument('--log-interval', type=int, default=5)
 parser.add_argument('--reset-interval', type=int, default=100)
-parser.add_argument('--buffer-size', type=int, default=512)
-parser.add_argument('--batch-size', type=int, default=256)
+parser.add_argument('--buffer-size', type=int, default=1000)
+parser.add_argument('--batch-size', type=int, default=128)
 parser.add_argument('--agent2', type=int, default=1)
-parser.add_argument('--num-episodes', type=int, default=750)
+parser.add_argument('--num-episodes', type=int, default=1000)
 parser.add_argument('--alpha', type=float, default=1)
 parser.add_argument('--epsilon', type=float, default=0.8)
 parser.add_argument('--alr', type=float, default=0.005)
 parser.add_argument('--clr', type=float, default=0.005)
+parser.add_argument('--shared', type=int, default=0)
 args = parser.parse_args()
 
 POL_HID_SIZE = 128
@@ -46,7 +47,8 @@ CRITIC_LR = args.clr
 ACTOR_LR  = args.alr
 ALPHA = args.alpha
 SEED = 42
-def a2_policy():
+
+def a2_policy(curr_state):
     return args.agent2
  
 def create_net(in_size, hidden_size, out_size):
@@ -62,7 +64,7 @@ def create_net(in_size, hidden_size, out_size):
     """
     return nn.Sequential(nn.Linear(in_size, hidden_size), 
                          nn.ReLU(),
-                        nn.Linear(hidden_size, out_size))
+                        nn.Linear(hidden_size, out_size)).to(DEVICE)
 
 def reset_weights(m):
     if isinstance(m, nn.Linear):
@@ -82,22 +84,22 @@ class SAC(nn.Module):
         # Initialize policy net
         self.policy_net     = create_net(in_size=num_states, hidden_size=128, out_size= num_actions)
         self.policy_net.append(nn.Softmax(dim=-1))
-        reset_weights(self.policy_net)
+        self.policy_net.apply(reset_weights)
 
         # Initialize Q nets and copy weights to target
         self.sa_value_net_1         = create_net(in_size=num_states, hidden_size=128, out_size= num_actions)
         self.sa_value_net_2         = create_net(in_size=num_states, hidden_size=128, out_size= num_actions)
         self.sa_value_target_net_1  = create_net(in_size=num_states, hidden_size=128, out_size= num_actions)
         self.sa_value_target_net_2  = create_net(in_size=num_states, hidden_size=128, out_size= num_actions)
-        reset_weights(self.sa_value_net_1)
-        reset_weights(self.sa_value_net_2)
+        self.sa_value_net_1.apply(reset_weights)
+        self.sa_value_net_2.apply(reset_weights)
         self.sa_value_target_net_1.load_state_dict(self.sa_value_net_1.state_dict())
         self.sa_value_target_net_2.load_state_dict(self.sa_value_net_2.state_dict())        
 
         # Initialize alpha
-        self.log_alpha = torch.zeros(1, requires_grad=False, device=DEVICE)
-        self.alpha = self.log_alpha.exp()
-        self.alpha = ALPHA
+        # self.log_alpha = torch.zeros(1, requires_grad=False, device=DEVICE)
+        self.alpha = torch.ones(1, requires_grad=True, device=DEVICE)
+        # self.alpha = ALPHA
         #TODO: Skipping alpha optimisation
 
         #Intialise replay buffer
@@ -107,13 +109,14 @@ class SAC(nn.Module):
         self.critic_optim_1 = torch.optim.Adam(self.sa_value_net_1.parameters(), lr=CRITIC_LR, eps=1e-4)
         self.critic_optim_2 = torch.optim.Adam(self.sa_value_net_2.parameters(), lr=CRITIC_LR, eps=1e-4)
         self.policy_optim   = torch.optim.Adam(self.policy_net.parameters(), lr=ACTOR_LR, eps=1e-4)
+        self.alpha_optim    = torch.optim.Adam([self.alpha], lr=ACTOR_LR/10, eps=1e-5)
 
         
     def forward(self):
       pass
         
     def sample_policy(self, states):
-        action_probs = self.policy_net(states)
+        action_probs = self.policy_net(states.to(DEVICE))
         action_dist = Categorical(action_probs)
         actions = action_dist.sample().view(-1, 1)
 
@@ -155,17 +158,19 @@ class SAC(nn.Module):
       self.critic_optim_1.zero_grad()
       self.critic_optim_2.zero_grad()
       self.policy_optim.zero_grad()
+      self.alpha_optim.zero_grad()
       
       buffer_samples = self.buffer.sample(batch_size=BUFFER_BATCH_SIZE)
       critic_1_losses = []
       critic_2_losses = []
       policy_losses = []
+      alpha_losses = []
       entropies = []
       
       for sample in buffer_samples:
         # (np.hstack((rewards, curr_state, next_state, action_t)))
         reward_1, curr_state, next_state, buff_action = self.unpack_buffer(sample)
-
+        curr_state, next_state = curr_state.to(DEVICE), next_state.to(DEVICE)
         # Computing Actor loss by minimizing TD Error wrt target
         q1_s_a = self.sa_value_net_1(curr_state)[buff_action]
         q2_s_a = self.sa_value_net_2(curr_state)[buff_action]
@@ -176,22 +181,30 @@ class SAC(nn.Module):
         # Computing policy net losses by Eq 9
         min_s_val = torch.min(self.sa_value_net_1(curr_state), self.sa_value_net_2(curr_state))
         _, action_probs, log_probs = self.sample_policy(curr_state)
-        policy_loss = (action_probs * (self.alpha * log_probs - min_s_val.detach())).sum(dim=-1)
+        policy_loss = (action_probs * (self.alpha.detach() * log_probs - min_s_val.detach())).sum(dim=-1)
         entropy = -(action_probs * log_probs).sum(dim=-1)
         policy_losses.append(policy_loss)
         entropies.append(entropy)
+        
+        # Computing alpha loss by Eq 11
+        target_ent = ALPHA
+        alpha_losses.append(action_probs.detach() * (-self.alpha * (log_probs + target_ent).detach()))
+        # alpha_loss = -(self.log_alpha * (log_pi + self.target_entropy).detach()).mean()
       
       
       critic_1_loss = torch.stack(critic_1_losses).sum()
       critic_2_loss = torch.stack(critic_2_losses).sum()
       policy_loss   = torch.stack(policy_losses).sum()
+      alpha_loss    = torch.stack(alpha_losses).sum()
       mean_entropy  = torch.stack(entropies).mean()
       net_loss = (critic_1_loss + critic_2_loss)/2 + policy_loss
       net_loss.backward()
+      #alpha_loss.backward()
 
       self.critic_optim_1.step()
       self.critic_optim_2.step()
       self.policy_optim.step()
+      self.alpha_optim.step()
 
 	  #Target network Soft update 
       for target_param, local_param in zip(self.sa_value_target_net_1.parameters(), self.sa_value_net_1.parameters()):
@@ -199,7 +212,7 @@ class SAC(nn.Module):
       for target_param, local_param in zip(self.sa_value_target_net_2.parameters(), self.sa_value_net_2.parameters()):
         target_param.data.copy_(TAU*local_param.data + (1.0-TAU)*target_param.data)
       
-      return critic_1_loss.detach().item(), critic_2_loss.detach().item(), policy_loss.detach().item(), net_loss, mean_entropy
+      return critic_1_loss.detach().item(), critic_2_loss.detach().item(), policy_loss.detach().item(), net_loss, mean_entropy, alpha_loss.detach().item()
             
           
 class IPDEnv(gym.Env):
@@ -264,7 +277,7 @@ def run(env_name = 'ipd', num_episodes=NUM_EPISODES, reset_interval=RESET_INTERV
     EP_LENGTH = 500 if env_name == 'cartpole' else EP_LENGTH
     env = IPDEnv(ep_length=EP_LENGTH) if env_name == 'ipd' else gym.make('CartPole-v1')
     curr_state, _ = env.reset(seed=SEED)
-    agent = SAC(num_states=len(curr_state), num_actions=2)
+    agent = SAC(num_states=len(curr_state), num_actions=2).to(DEVICE)
     for ep_num in range(num_episodes):
         curr_state, _ = env.reset(seed=SEED)
         curr_state = torch.tensor(curr_state).float()
@@ -279,12 +292,15 @@ def run(env_name = 'ipd', num_episodes=NUM_EPISODES, reset_interval=RESET_INTERV
             #Choose and execute action
             # action_t = agent.greedy_policy(curr_state) if not eps_greedy_flags_1[i] else np.random.choice([0,1]).item()
             action_t = agent.greedy_policy(curr_state)
-            action_t = [action_t, a2_policy()] if env_name == "ipd" else action_t
+            action_t = [action_t, a2_policy(curr_state)] if env_name == "ipd" else action_t
             actions_taken.append(action_t)
             next_state, rewards, is_done, _, _ = env.step(action_t)
             
             #Compute and edit reward if needed
-            reward_1 = rewards[0] if env_name == 'ipd' else rewards
+            if env_name == 'ipd':
+                reward_1 = rewards[0] if not args.shared else rewards[0] + rewards[1]
+            else: 
+                reward_1 = rewards
             episode_reward += reward_1
             if env_name == 'cartpole' and is_done and len(ep_buffer) < 400: reward_1 =-5
             
@@ -300,9 +316,10 @@ def run(env_name = 'ipd', num_episodes=NUM_EPISODES, reset_interval=RESET_INTERV
         if len(agent.buffer) < BUFFER_BATCH_SIZE: 
             print("Filling buffer. Skipping update")
             continue
-        c1_loss, c2_loss, pol_loss, net_loss, mean_entropy = agent.update()
-        wandb.log({"Episode":ep_num,  "Ep Reward": episode_reward, "Critic Loss 1" : round(c1_loss,2), "Critic Loss 2" : round(c2_loss,2), 
-                   "Policy loss" : round(pol_loss,2),  "Net": round(net_loss.item(),2), "Entropy":round(mean_entropy.item(),2)})
+        c1_loss, c2_loss, pol_loss, net_loss, mean_entropy, alpha_loss = agent.update()
+        wandb.log({"Episode":ep_num,  "Ep Reward": episode_reward, "Entropy":round(mean_entropy.item(),2), 
+                   "Critic Loss 1" : round(c1_loss,2), "Critic Loss 2" : round(c2_loss,2),  "Policy loss" : round(pol_loss,2),  
+                   "Net": round(net_loss.item(),2), 'Alpha':agent.alpha, "Alpha Loss":alpha_loss})
         print(f"Episode: {ep_num} \t Ep Reward : {episode_reward} \t Critic Losses : {round(c1_loss,2)} \t | {round(c2_loss,2)}. \t Policy loss : {round(pol_loss,2)} \t Net : {round(net_loss.item(),2)} \t Entropy:{round(mean_entropy.item(),2)}")
         # log results
         if ep_num % args.log_interval == 0:
@@ -315,6 +332,14 @@ def run(env_name = 'ipd', num_episodes=NUM_EPISODES, reset_interval=RESET_INTERV
                     print("A%d Defect Prob - %s : %r"%(agent_ind, state_name, state_action_probs.detach()[1]))
                     defect_probs["A%d Defect Prob - %s"%(agent_ind, state_name)] = state_action_probs.detach()[1]
             wandb.log(defect_probs)
+            
+        if ep_num % RESET_INTERVAL == 0:
+            agent.policy_net.apply(reset_weights)
+            agent.sa_value_net_1.apply(reset_weights)
+            agent.sa_value_net_2.apply(reset_weights)
+            agent.sa_value_target_net_1.apply(reset_weights)
+            agent.sa_value_target_net_2.apply(reset_weights)
+            print ("RESET")
     
 if __name__ == "__main__":
     RUN_ENV = 'ipd'
@@ -327,7 +352,9 @@ if __name__ == "__main__":
                 'tau':TAU,
                 'gamma':GAMMA,
                 'alpha':ALPHA,
-                'ep_length':EP_LENGTH
+                'agent2':args.agent2,
+                'ep_length':EP_LENGTH,
+                'shared':args.shared
                 }
     wandb.init(project="IPD Actor-Critic v2", config=exp_args)
     run(env_name=RUN_ENV)
