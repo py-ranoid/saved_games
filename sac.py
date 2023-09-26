@@ -166,6 +166,8 @@ class SAC(nn.Module):
       critic_1_losses = []
       critic_2_losses = []
       policy_losses = []
+      policy_entropies = []
+      policy_q_losses = []
       alpha_losses = []
       entropies = []
       
@@ -183,9 +185,15 @@ class SAC(nn.Module):
         # Computing policy net losses by Eq 9
         min_s_val = torch.min(self.sa_value_net_1(curr_state), self.sa_value_net_2(curr_state))
         _, action_probs, log_probs = self.sample_policy(curr_state)
-        policy_loss = (action_probs * (self.alpha.detach() * log_probs - min_s_val.detach())).sum(dim=-1)
+        policy_entropy    = (action_probs * log_probs).sum(dim=-1)
+        policy_q_loss     = (- action_probs * min_s_val.detach()).sum(dim=-1)        
+        
+        #Minimizing entropy loss and maximising state values of actions with high prob
+        policy_loss       = self.alpha.detach() * policy_entropy + policy_q_loss
         entropy = -(action_probs * log_probs).sum(dim=-1)
         policy_losses.append(policy_loss)
+        policy_entropies.append(policy_entropy)
+        policy_q_losses.append(policy_q_loss)
         entropies.append(entropy)
         
         # Computing alpha loss by Eq 11
@@ -196,10 +204,12 @@ class SAC(nn.Module):
       
       critic_1_loss = torch.stack(critic_1_losses).sum()
       critic_2_loss = torch.stack(critic_2_losses).sum()
-      policy_loss   = torch.stack(policy_losses).sum()
+      net_policy_loss   = torch.stack(policy_losses).sum()
+      net_policy_entropy   = torch.stack(policy_entropies).sum()
+      net_policy_q_loss    = torch.stack(policy_q_losses).sum()
       alpha_loss    = torch.stack(alpha_losses).sum()
       mean_entropy  = torch.stack(entropies).mean()
-      net_loss = (critic_1_loss + critic_2_loss)/2 + policy_loss
+      net_loss = (critic_1_loss + critic_2_loss)/2 + net_policy_loss
       net_loss.backward()
       #alpha_loss.backward()
 
@@ -219,7 +229,9 @@ class SAC(nn.Module):
                 {f"A{self.agent_num} Entropy"       : mean_entropy, 
                  f"A{self.agent_num} Critic Loss 1" : round(critic_1_loss.detach().item(),2), 
                  f"A{self.agent_num} Critic Loss 2" : round(critic_2_loss.detach().item(),2), 
-                 f"A{self.agent_num} Policy loss"   : round(policy_loss.detach().item(),2), 
+                 f"A{self.agent_num} Policy loss"   : round(net_policy_loss.detach().item(),2), 
+                 f"A{self.agent_num} Poli Q loss"   : round(net_policy_q_loss.detach().item(),2), 
+                 f"A{self.agent_num} Poli Ent loss" : round(net_policy_entropy.detach().item(),2), 
                  f"A{self.agent_num} Net Loss"      : round(net_loss.item(),2), 
                  f"A{self.agent_num} Alpha"         : self.alpha, 
                  f"A{self.agent_num} Alpha Loss"    : alpha_loss.detach().item()}
