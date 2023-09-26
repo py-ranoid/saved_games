@@ -9,6 +9,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.distributions import Categorical
 from torchrl.data import ReplayBuffer, ListStorage
+from pprint import pprint
 
 DEVICE = torch.device('cpu')
 if torch.cuda.is_available():
@@ -19,15 +20,16 @@ parser.add_argument('--gamma', type=float, default=0.99)
 parser.add_argument('--seed', type=int, default=543)
 parser.add_argument('--render', action='store_true')
 parser.add_argument('--log-interval', type=int, default=5)
-parser.add_argument('--reset-interval', type=int, default=100)
+parser.add_argument('--reset-interval', type=int, default=10000)
+parser.add_argument('--reset-offset', type=int, default=-1)
 parser.add_argument('--buffer-size', type=int, default=1000)
 parser.add_argument('--batch-size', type=int, default=128)
-parser.add_argument('--agent2', type=int, default=1)
+parser.add_argument('--agent2', type=str, default='tft')
 parser.add_argument('--num-episodes', type=int, default=1000)
 parser.add_argument('--alpha', type=float, default=1)
 parser.add_argument('--epsilon', type=float, default=0.8)
-parser.add_argument('--alr', type=float, default=0.005)
-parser.add_argument('--clr', type=float, default=0.005)
+parser.add_argument('--alr', type=float, default=0.003)
+parser.add_argument('--clr', type=float, default=0.003)
 parser.add_argument('--shared', type=int, default=0)
 args = parser.parse_args()
 
@@ -36,6 +38,7 @@ MARKOVIAN_STATES = ['XX', 'CC', 'CD', 'DC', 'DD']
 STATES_LEN = len(MARKOVIAN_STATES)
 EP_LENGTH = 50
 RESET_INTERVAL = args.reset_interval
+RESET_OFFSET = int(args.reset_interval / 2) if args.reset_offset == -1 else args.reset_offset
 BUFFER_BATCH_SIZE = args.batch_size
 BUFFER_LEN = args.buffer_size
 NUM_EPISODES = args.num_episodes
@@ -48,9 +51,6 @@ ACTOR_LR  = args.alr
 ALPHA = args.alpha
 SEED = 42
 
-def a2_policy(curr_state):
-    return args.agent2
- 
 def create_net(in_size, hidden_size, out_size):
     """Creates a two-layer fully connected neural net with ReLU before the hidden layer
 
@@ -80,7 +80,9 @@ class SAC(nn.Module):
         super(SAC, self).__init__()
         self.num_states = num_states
         self.num_actions = num_actions
-		
+        self.is_learning = True
+        self.agent_num = 0  
+        
         # Initialize policy net
         self.policy_net     = create_net(in_size=num_states, hidden_size=128, out_size= num_actions)
         self.policy_net.append(nn.Softmax(dim=-1))
@@ -99,7 +101,6 @@ class SAC(nn.Module):
         # Initialize alpha
         # self.log_alpha = torch.zeros(1, requires_grad=False, device=DEVICE)
         self.alpha = torch.ones(1, requires_grad=True, device=DEVICE)
-        # self.alpha = ALPHA
         #TODO: Skipping alpha optimisation
 
         #Intialise replay buffer
@@ -110,6 +111,7 @@ class SAC(nn.Module):
         self.critic_optim_2 = torch.optim.Adam(self.sa_value_net_2.parameters(), lr=CRITIC_LR, eps=1e-4)
         self.policy_optim   = torch.optim.Adam(self.policy_net.parameters(), lr=ACTOR_LR, eps=1e-4)
         self.alpha_optim    = torch.optim.Adam([self.alpha], lr=ACTOR_LR/10, eps=1e-5)
+        self.alpha = self.alpha * ALPHA
 
         
     def forward(self):
@@ -153,7 +155,7 @@ class SAC(nn.Module):
         buff_action = sample[1+2*self.num_states].detach().int().item()
         return reward_1, curr_state, next_state, buff_action
 
-    def update(self):
+    def update(self, wandb_dict={}):
       #Sample transitions from buffer
       self.critic_optim_1.zero_grad()
       self.critic_optim_2.zero_grad()
@@ -212,9 +214,54 @@ class SAC(nn.Module):
       for target_param, local_param in zip(self.sa_value_target_net_2.parameters(), self.sa_value_net_2.parameters()):
         target_param.data.copy_(TAU*local_param.data + (1.0-TAU)*target_param.data)
       
-      return critic_1_loss.detach().item(), critic_2_loss.detach().item(), policy_loss.detach().item(), net_loss, mean_entropy, alpha_loss.detach().item()
+      if "Episode" in wandb_dict:
+        wandb_dict.update(
+                {f"A{self.agent_num} Entropy"       : mean_entropy, 
+                 f"A{self.agent_num} Critic Loss 1" : round(critic_1_loss.detach().item(),2), 
+                 f"A{self.agent_num} Critic Loss 2" : round(critic_2_loss.detach().item(),2), 
+                 f"A{self.agent_num} Policy loss"   : round(policy_loss.detach().item(),2), 
+                 f"A{self.agent_num} Net Loss"      : round(net_loss.item(),2), 
+                 f"A{self.agent_num} Alpha"         : self.alpha, 
+                 f"A{self.agent_num} Alpha Loss"    : alpha_loss.detach().item()}
+                )
+        wandb.log(wandb_dict)
+        return wandb_dict
+    
+    def reset_nets(self):
+        self.policy_net.apply(reset_weights)
+        self.sa_value_net_1.apply(reset_weights)
+        self.sa_value_net_2.apply(reset_weights)
+        self.sa_value_target_net_1.apply(reset_weights)
+        self.sa_value_target_net_2.apply(reset_weights)
+        
             
-          
+class Opponent(SAC):
+    
+    def __init__(self, num_states, num_actions, response='tft'):
+        super(Opponent, self).__init__(num_states, num_actions)
+        self.response    = response
+        self.is_learning = self.response == 'sac'
+        self.agent_num   = 1
+
+    def flip_state(self, curr_state_1):
+        # Flips a state wrt 1 
+        if curr_state_1[0] or curr_state_1[1] or curr_state_1[4]: 
+            return curr_state_1
+        else: return torch.tensor([0,0,1,1,0]) - curr_state_1
+
+    def greedy_policy(self, curr_state):
+        action_index = int(torch.sum(curr_state * torch.arange(5)))
+        if   self.response == 'cop':   # Always Cooperate
+            return 0
+        elif self.response == 'def': # Always Defect
+            return 1
+        elif self.response == 'tft': # Tit-for-Tat
+            return int(action_index in {2,4})
+        elif self.response == 'rnd':
+            return int(torch.rand(1)>0.5)
+        elif self.response == 'sac': # SAC
+            return super().greedy_policy(curr_state)
+        
 class IPDEnv(gym.Env):
   """Custom Gym Environment to play IPD"""
 #   metadata = {'render.modes': ['human']}
@@ -272,74 +319,97 @@ class IPDEnv(gym.Env):
   def render(self, mode='human', close=False):
     pass
 
-def run(env_name = 'ipd', num_episodes=NUM_EPISODES, reset_interval=RESET_INTERVAL):    
+def run(env_name = 'ipd', num_episodes=NUM_EPISODES, reset_interval=RESET_INTERVAL):
     global EP_LENGTH
     EP_LENGTH = 500 if env_name == 'cartpole' else EP_LENGTH
+    
+    #Create agent, opponent and environment
     env = IPDEnv(ep_length=EP_LENGTH) if env_name == 'ipd' else gym.make('CartPole-v1')
     curr_state, _ = env.reset(seed=SEED)
-    agent = SAC(num_states=len(curr_state), num_actions=2).to(DEVICE)
+    agent =      SAC(num_states=len(curr_state), num_actions=2).to(DEVICE)
+    oppnt = Opponent(num_states=len(curr_state), num_actions=2, response=args.agent2).to(DEVICE)
+    
     for ep_num in range(num_episodes):
+        # Initialise environment, buffer and episode rewards
         curr_state, _ = env.reset(seed=SEED)
         curr_state = torch.tensor(curr_state).float()
-        ep_buffer = []
-        episode_reward = 0
-        actions_taken = []
-        rewards_recd = []
-        epsilon = EPS_GREEDY_PROB
-        epsilon += max(float(ep_num)*0.2/500.0,0.2)
-        # eps_greedy_flags_1 = torch.rand(EP_LENGTH+1)> epsilon
+        ep_buffer, ep_buffer_2    = [], []
+        episode_reward_1, episode_reward_2 = 0, 0
+
         for i in range(EP_LENGTH+1):
             #Choose and execute action
-            # action_t = agent.greedy_policy(curr_state) if not eps_greedy_flags_1[i] else np.random.choice([0,1]).item()
-            action_t = agent.greedy_policy(curr_state)
-            action_t = [action_t, a2_policy(curr_state)] if env_name == "ipd" else action_t
-            actions_taken.append(action_t)
+            action1_t = agent.greedy_policy(curr_state)
+            action2_t = oppnt.greedy_policy(oppnt.flip_state(curr_state))
+            action_t = [action1_t, action2_t] if env_name == "ipd" else action1_t
             next_state, rewards, is_done, _, _ = env.step(action_t)
             
-            #Compute and edit reward if needed
+            #Compute rewards
             if env_name == 'ipd':
                 reward_1 = rewards[0] if not args.shared else rewards[0] + rewards[1]
+                reward_2 = rewards[1] if not args.shared else rewards[0] + rewards[1]
+                episode_reward_2 += reward_2
             else: 
                 reward_1 = rewards
-            episode_reward += reward_1
+            episode_reward_1 += reward_1
             if env_name == 'cartpole' and is_done and len(ep_buffer) < 400: reward_1 =-5
             
-            #Add to buffer and update next state
-            buffer_t = torch.tensor(np.hstack((reward_1, curr_state, next_state, action_t)))
+            #Add to agent's buffer 
+            buffer_t  = torch.tensor(np.hstack((reward_1, curr_state, next_state, action_t)))
             ep_buffer.append(buffer_t)
+            
+            #Add to opponent's buffer 
+            if oppnt.is_learning:
+                buffer2_t = torch.tensor(np.hstack((reward_2, oppnt.flip_state(curr_state), oppnt.flip_state(next_state), [action2_t, action1_t])))
+                ep_buffer_2.append(buffer2_t)
+            
             curr_state = torch.tensor(next_state).float()
             
             if is_done: break
-        # for i in range(len(ep_buffer)-2, -1, -1):
-        #   ep_buffer[i][0] = ep_buffer[i+1][0]*GAMMA + ep_buffer[i][0]
+
+        # Add episode to replay buffers 
         agent.buffer.extend(ep_buffer)
-        if len(agent.buffer) < BUFFER_BATCH_SIZE: 
+        if oppnt.is_learning:
+            oppnt.buffer.extend(ep_buffer_2)
+                    
+        # Train agent and opponent
+        if len(agent.buffer) < BUFFER_BATCH_SIZE or (oppnt.is_learning and len(oppnt.buffer) < BUFFER_BATCH_SIZE):
             print("Filling buffer. Skipping update")
             continue
-        c1_loss, c2_loss, pol_loss, net_loss, mean_entropy, alpha_loss = agent.update()
-        wandb.log({"Episode":ep_num,  "Ep Reward": episode_reward, "Entropy":round(mean_entropy.item(),2), 
-                   "Critic Loss 1" : round(c1_loss,2), "Critic Loss 2" : round(c2_loss,2),  "Policy loss" : round(pol_loss,2),  
-                   "Net": round(net_loss.item(),2), 'Alpha':agent.alpha, "Alpha Loss":alpha_loss})
-        print(f"Episode: {ep_num} \t Ep Reward : {episode_reward} \t Critic Losses : {round(c1_loss,2)} \t | {round(c2_loss,2)}. \t Policy loss : {round(pol_loss,2)} \t Net : {round(net_loss.item(),2)} \t Entropy:{round(mean_entropy.item(),2)}")
-        # log results
+        agent.train()
+        wandb_dict_A1 = agent.update(wandb_dict={"Episode":ep_num,  "Ep Reward": episode_reward_1})
+        pprint(wandb_dict_A1)
+        
+        if oppnt.is_learning:
+            oppnt.train()
+            wandb_dict_A2 = oppnt.update(wandb_dict={"Episode":ep_num,  "Ep Reward": episode_reward_2})
+            print("A2 update")
+            print(oppnt.agent_num)
+            pprint(wandb_dict_A2)
+        
+        # Log defect probabilities for each state
         if ep_num % args.log_interval == 0:
-            defect_probs = {}
-            for agent_ind, agent_model in enumerate([agent]):
-                for state_ind, state_name in enumerate(MARKOVIAN_STATES):
-                    state = torch.zeros((5))
-                    state[state_ind] = 1
-                    _, state_action_probs, _ = agent_model.sample_policy(state)
-                    print("A%d Defect Prob - %s : %r"%(agent_ind, state_name, state_action_probs.detach()[1]))
-                    defect_probs["A%d Defect Prob - %s"%(agent_ind, state_name)] = state_action_probs.detach()[1]
-            wandb.log(defect_probs)
+            agent.eval()            
+            oppnt.eval()            
+            with torch.no_grad():
+                defect_probs = {"Episode":ep_num}
+                for agent_model in [agent, oppnt]:
+                    if agent_model.is_learning:
+                        for state_ind, state_name in enumerate(MARKOVIAN_STATES):
+                            state = torch.zeros((5))
+                            state[state_ind] = 1
+                            _, state_action_probs, _ = agent_model.sample_policy(state)
+                            # print("A%d Defect Prob - %s : %r"%(agent_model.agent_num, state_name, state_action_probs.detach()[1]))
+                            defect_probs["A%d Defect Prob - %s"%(agent_model.agent_num, state_name)] = state_action_probs.detach()[1]
+                wandb.log(defect_probs)
+                pprint(defect_probs)
             
         if ep_num % RESET_INTERVAL == 0:
-            agent.policy_net.apply(reset_weights)
-            agent.sa_value_net_1.apply(reset_weights)
-            agent.sa_value_net_2.apply(reset_weights)
-            agent.sa_value_target_net_1.apply(reset_weights)
-            agent.sa_value_target_net_2.apply(reset_weights)
-            print ("RESET")
+            agent.reset_nets()
+            print ("RESET 1")
+
+        if ep_num % RESET_INTERVAL == RESET_OFFSET:
+            oppnt.reset_nets()
+            print ("RESET 2")
     
 if __name__ == "__main__":
     RUN_ENV = 'ipd'
@@ -354,7 +424,16 @@ if __name__ == "__main__":
                 'alpha':ALPHA,
                 'agent2':args.agent2,
                 'ep_length':EP_LENGTH,
-                'shared':args.shared
+                'shared':args.shared,
                 }
-    wandb.init(project="IPD Actor-Critic v2", config=exp_args)
+    print(exp_args)
+    # for state_ind, state_name in enumerate(MARKOVIAN_STATES):
+    #     state = torch.zeros((5))
+    #     state[state_ind] = 1
+    #     a2_response = a2_policy(state)
+    #     print("A%d Defect Prob - %s : %r"%(1, state_name, float(a2_response==1)*100))
+    shar = "Shared" if args.shared else "Greedy"
+    run_name = f"A2-{args.agent2}-{shar}-RES{RESET_INTERVAL}-RO{RESET_OFFSET}-LR{args.alr}"
+    wandb.init(project="IPD Actor-Critic v2", config=exp_args, name=run_name)
+    wandb.define_metric("Episode")
     run(env_name=RUN_ENV)
