@@ -115,7 +115,7 @@ class SAC(nn.Module):
 
 		
 	def forward(self):
-	  pass
+		pass
 		
 	def sample_policy(self, states):
 		action_probs = self.policy_net(states.to(DEVICE))
@@ -166,80 +166,107 @@ class SAC(nn.Module):
 		self.critic_optim_2.step()
 		self.policy_optim.step()
 		self.alpha_optim.step()
-		
+	
 	def update(self, wandb_dict={}):
 		#Sample transitions from buffer
-		self._reset_grads()
 		buffer_samples = self.buffer.sample(batch_size=BUFFER_BATCH_SIZE)
-		critic_1_losses = []
-		critic_2_losses = []
 		policy_losses = []
 		policy_entropies = []
 		policy_q_losses = []
 		alpha_losses = []
 		entropies = []
-	  
-		for sample in buffer_samples:
-			# (np.hstack((rewards, curr_state, next_state, action_t)))
-			reward_1, curr_state, next_state, buff_action = self.unpack_buffer(sample)
-			curr_state, next_state = curr_state.to(DEVICE), next_state.to(DEVICE)
-			# Computing Actor loss by minimizing TD Error wrt target
-			q1_s_a = self.sa_value_net_1(curr_state)[buff_action]
-			q2_s_a = self.sa_value_net_2(curr_state)[buff_action]
-			q_s_a_target = reward_1 + GAMMA * self.calc_state_val(next_state)
-			critic_1_losses.append(F.mse_loss(q1_s_a, q_s_a_target.detach()))
-			critic_2_losses.append(F.mse_loss(q2_s_a, q_s_a_target.detach()))
+		###################################################################################################
+  		###################################################################################################
 
-			# Computing policy net losses by Eq 9
+		#Reset critic optim gradients 
+		critic_1_losses = []
+		self.critic_optim_1.zero_grad()
+
+		# Computing Actor loss by minimizing TD Error wrt target
+		for sample in buffer_samples:
+			reward, curr_state, next_state, buff_action = self.unpack_buffer(sample)
+			curr_state, next_state = curr_state.to(DEVICE), next_state.to(DEVICE)
+
+			q1_s_a = self.sa_value_net_1(curr_state)[buff_action]
+			q_s_a_target = reward + GAMMA * self.calc_state_val(next_state)
+			critic_1_losses.append(F.huber_loss(q1_s_a, q_s_a_target.detach()))
+			  
+		# Backpropogate critic losses
+		critic_1_loss = torch.stack(critic_1_losses).sum()
+		critic_1_loss.backward()
+		self.critic_optim_1.step()
+		##################################################
+		
+  		#Reset critic optim gradients 
+		critic_2_losses = []
+		self.critic_optim_2.zero_grad()	  
+
+		# Computing Actor loss by minimizing TD Error wrt target
+		for sample in buffer_samples:
+			reward, curr_state, next_state, buff_action = self.unpack_buffer(sample)
+			curr_state, next_state = curr_state.to(DEVICE), next_state.to(DEVICE)
+
+			q2_s_a = self.sa_value_net_2(curr_state)[buff_action]
+			q_s_a_target = reward + GAMMA * self.calc_state_val(next_state)
+			critic_2_losses.append(F.huber_loss(q2_s_a, q_s_a_target.detach()))
+			  
+		# Backpropogate critic losses
+		critic_2_loss = torch.stack(critic_2_losses).sum()
+		critic_2_loss.backward()
+		self.critic_optim_2.step()
+		###################################################################################################
+  		###################################################################################################
+
+  		#Reset policy optim gradients 
+		self.policy_optim.zero_grad()
+		# Computing policy net losses by Eq 9
+		for sample in buffer_samples:
+			_ , curr_state, _ , _ = self.unpack_buffer(sample)
+			curr_state = curr_state.to(DEVICE)
+
+			#Minimizing entropy loss and maximising state values of actions with high prob
 			min_s_val = torch.min(self.sa_value_net_1(curr_state), self.sa_value_net_2(curr_state))
 			_, action_probs, log_probs = self.sample_policy(curr_state)
 			policy_entropy    = (action_probs * log_probs).sum(dim=-1)
 			policy_q_loss     = (- action_probs * min_s_val.detach()).sum(dim=-1)        
-
-			#Minimizing entropy loss and maximising state values of actions with high prob
 			policy_loss       = self.alpha.detach() * policy_entropy + policy_q_loss
-			entropy = -(action_probs * log_probs).sum(dim=-1)
+
 			policy_losses.append(policy_loss)
 			policy_entropies.append(policy_entropy)
 			policy_q_losses.append(policy_q_loss)
-			entropies.append(entropy)
-		
+
 			# Computing alpha loss by Eq 11
-			target_ent = ALPHA
-			alpha_losses.append(action_probs.detach() * (-self.alpha * (log_probs + target_ent).detach()))
+			# target_ent = ALPHA
+			# alpha_losses.append(action_probs.detach() * (-self.alpha * (log_probs + target_ent).detach()))
 			# alpha_loss = -(self.log_alpha * (log_pi + self.target_entropy).detach()).mean()
-	  
-	  
-		critic_1_loss = torch.stack(critic_1_losses).sum()
-		critic_2_loss = torch.stack(critic_2_losses).sum()
-		net_policy_loss   = torch.stack(policy_losses).sum()
+
+        
+		net_policy_loss   	 = torch.stack(policy_losses).sum()
 		net_policy_entropy   = torch.stack(policy_entropies).sum()
 		net_policy_q_loss    = torch.stack(policy_q_losses).sum()
-		alpha_loss    = torch.stack(alpha_losses).sum()
-		mean_entropy  = torch.stack(entropies).mean()
-		net_loss = (critic_1_loss + critic_2_loss)/2 + net_policy_loss
-		net_loss.backward()
+		# alpha_loss    		 = torch.stack(alpha_losses).sum()
+		net_policy_loss.backward()
+		self.policy_optim.step()
 		#alpha_loss.backward()
-
-		self._run_optim()
 		#Target network Soft update 
 		for target_param, local_param in zip(self.sa_value_target_net_1.parameters(), self.sa_value_net_1.parameters()):
 			target_param.data.copy_(TAU*local_param.data + (1.0-TAU)*target_param.data)
 		for target_param, local_param in zip(self.sa_value_target_net_2.parameters(), self.sa_value_net_2.parameters()):
 			target_param.data.copy_(TAU*local_param.data + (1.0-TAU)*target_param.data)
+		###################################################################################################
+  		###################################################################################################
 
 		if "Episode" in wandb_dict:
-			wandb_dict.update(
-					{f"A{self.agent_num} Entropy"       : mean_entropy, 
-						f"A{self.agent_num} Critic Loss 1" : round(critic_1_loss.detach().item(),2), 
+			wandb_dict.update({	
+                      	f"A{self.agent_num} Critic Loss 1" : round(critic_1_loss.detach().item(),2), 
 						f"A{self.agent_num} Critic Loss 2" : round(critic_2_loss.detach().item(),2), 
 						f"A{self.agent_num} Policy loss"   : round(net_policy_loss.detach().item(),2), 
 						f"A{self.agent_num} Poli Q loss"   : round(net_policy_q_loss.detach().item(),2), 
 						f"A{self.agent_num} Poli Ent loss" : round(net_policy_entropy.detach().item(),2), 
-						f"A{self.agent_num} Net Loss"      : round(net_loss.item(),2), 
-						f"A{self.agent_num} Alpha"         : self.alpha, 
-						f"A{self.agent_num} Alpha Loss"    : alpha_loss.detach().item()}
-					)
+						f"A{self.agent_num} Net Loss"      : round(((critic_1_loss + critic_2_loss)/2+net_policy_loss).item(),2), 
+						f"A{self.agent_num} Alpha"         : self.alpha
+						# f"A{self.agent_num} Alpha Loss"    : alpha_loss.detach().item()
+      				})
 			wandb.log(wandb_dict)
 
 		return wandb_dict
@@ -414,6 +441,7 @@ def run(env_name = 'ipd', num_episodes=NUM_EPISODES, reset_interval=RESET_INTERV
 							_, state_action_probs, _ = agent_model.sample_policy(state)
 							# print("A%d Defect Prob - %s : %r"%(agent_model.agent_num, state_name, state_action_probs.detach()[1]))
 							defect_probs["A%d Defect Prob - %s"%(agent_model.agent_num, state_name)] = state_action_probs.detach()[1]
+							defect_probs["A%d Defect Val - %s"%(agent_model.agent_num, state_name)]  = agent_model.sa_value_net_1(state.to(DEVICE)).detach()[1]
 				wandb.log(defect_probs)
 				pprint(defect_probs)
 			
